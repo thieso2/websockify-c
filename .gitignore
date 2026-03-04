@@ -1,0 +1,6 @@
+# Compiled objects
+*.o
+
+# Binaries
+websockify
+tests/test_websocket

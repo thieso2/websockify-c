@@ -1,65 +1,82 @@
 # websockify-codex
 
-ANSI C-focused WebSocket proxy implementation with a standalone `websockify` executable.
+A standalone **ANSI C rewrite** of [websockify](https://github.com/novnc/websockify), created by [OpenAI Codex](https://openai.com/index/openai-codex/). It proxies WebSocket connections to plain TCP backends and serves the same purpose as the original Python implementation — most notably enabling browser-based VNC clients (e.g. [noVNC](https://novnc.com)) to connect to VNC servers.
 
-## Scope
+## Features
 
-This directory has two deliverables:
+- Single static binary, no runtime dependencies
+- Non-blocking event loop with `select()`
+- HTTP upgrade handshake (RFC 6455)
+- HyBi WebSocket framing (encode/decode, ping/pong)
+- Static file serving (`--web`)
+- Per-connection concurrency with periodic verbose stats
+- CLI syntax compatible with Python websockify
 
-- `websockify` binary: native C WebSocket-to-TCP proxy.
-- C protocol core + tests: handshake/frame logic validated by a direct test port.
-
-The C protocol test scope currently covers:
-
-- server accept handshake validation
-- subprotocol negotiation behavior
-- ping/pong frame generation
-- HyBi frame encode/decode behavior
-
-## Build and test
+## Build
 
 ```sh
-make -C websockify-codex
-make -C websockify-codex test
+make
+make test
 ```
 
-This builds:
+Requires a C99-capable compiler (`cc` / `gcc` / `clang`) and POSIX headers.
 
-- `websockify-codex/websockify` (native proxy binary)
-- `websockify-codex/tests/test_websocket` (C test binary)
-
-And runs:
-
-- `websockify-codex/tests/test_websocket.c`
-
-## Run
+## Usage
 
 ```sh
-./websockify-codex/websockify --help
-./websockify-codex/websockify 6080 localhost:5900
+./websockify [options] [source_addr:]source_port target_addr:target_port
+./websockify [options] --token-plugin=CLASS [source_addr:]source_port
+./websockify [options] --unix-target=FILE [source_addr:]source_port
+./websockify [options] [source_addr:]source_port -- WRAP_COMMAND_LINE
 ```
 
-CLI syntax now matches Python websockify call patterns:
+### Common options
+
+| Option | Description |
+|---|---|
+| `--web DIR` | Serve static files from `DIR` alongside the WebSocket proxy |
+| `--verbose` | Enable verbose logging |
+| `--log-file FILE` | Write log output to `FILE` |
+| `--record FILE` | Record WebSocket traffic to `FILE` |
+| `--daemon` | Run in the background |
+
+Run `./websockify --help` for the full option list.
+
+### Quick start — noVNC + VNC
 
 ```sh
-./websockify-codex/websockify [options] [source_addr:]source_port target_addr:target_port
-./websockify-codex/websockify [options] --token-plugin=CLASS [source_addr:]source_port
-./websockify-codex/websockify [options] --unix-target=FILE [source_addr:]source_port
-./websockify-codex/websockify [options] [source_addr:]source_port -- WRAP_COMMAND_LINE
+# Proxy WebSocket port 6080 → VNC server on localhost:5900
+./websockify 6080 localhost:5900
+
+# With built-in noVNC web serving
+./websockify --web /path/to/noVNC 6080 localhost:5900
 ```
 
-Runtime implementation status:
+## Implementation status
 
-- Argument parsing and validation mirrors Python option semantics.
-- Native proxy data path is implemented for direct TCP target mode.
-- `--web` static file serving and mixed HTTP/WebSocket mode are implemented.
-- Some Python runtime features are parsed but currently return explicit `not implemented` errors in C (TLS stack, unix/inetd, wrap, plugin execution, syslog/libserver, `--web-auth`).
+| Feature | Status |
+|---|---|
+| Direct TCP proxy | Implemented |
+| HTTP/WebSocket upgrade | Implemented |
+| Static file serving (`--web`) | Implemented |
+| HyBi frame encode/decode | Implemented |
+| Ping/pong keepalive | Implemented |
+| Non-blocking event loop | Implemented |
+| TLS/SSL | Not implemented |
+| Unix socket target | Not implemented |
+| inetd mode | Not implemented |
+| Token plugins | Not implemented (parsed, returns error) |
+| Wrap command | Not implemented (parsed, returns error) |
 
-The C tests are a one-to-one behavioral port of Python websocket unit tests in:
+## Tests
 
-- `tests/test_websocket.py`
+The C test suite is a behavioural port of the Python websocket unit tests:
 
-## Notes
+```sh
+make test
+# runs tests/test_websocket
+```
 
-- Build is configured with `-std=c99` and POSIX declarations enabled for string helpers.
-- Test harness is self-contained in `tests/test_common.h`.
+## License
+
+LGPLv3 — same as the original [novnc/websockify](https://github.com/novnc/websockify). See [LICENSE](LICENSE).
