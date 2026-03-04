@@ -1,0 +1,85 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - os: linux
+            arch: x86_64
+            runner: ubuntu-latest
+            cc: gcc
+            artifact: websockify-linux-x86_64
+
+          - os: linux
+            arch: aarch64
+            runner: ubuntu-latest
+            cc: aarch64-linux-gnu-gcc
+            artifact: websockify-linux-aarch64
+
+          - os: darwin
+            arch: x86_64
+            runner: macos-13
+            cc: cc
+            artifact: websockify-darwin-x86_64
+
+          - os: darwin
+            arch: arm64
+            runner: macos-latest
+            cc: cc
+            artifact: websockify-darwin-arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cross-compiler (Linux aarch64 only)
+        if: matrix.arch == 'aarch64'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build
+        run: make CC=${{ matrix.cc }}
+
+      - name: Rename binary
+        run: cp websockify ${{ matrix.artifact }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+
+      - name: Flatten artifacts
+        run: |
+          for d in dist/*/; do
+            mv "$d"* dist/
+            rmdir "$d"
+          done
+          ls -lh dist/
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
