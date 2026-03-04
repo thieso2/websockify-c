@@ -66,10 +66,8 @@ jobs:
 
       - name: Flatten artifacts
         run: |
-          for d in dist/*/; do
-            mv "$d"* dist/
-            rmdir "$d"
-          done
+          find dist -mindepth 2 -maxdepth 2 -type f -exec mv {} dist/ \;
+          find dist -mindepth 1 -maxdepth 1 -type d -exec rmdir {} \;
           ls -lh dist/
 
       - name: Create release
