@@ -25,12 +25,6 @@ jobs:
             artifact: websockify-linux-aarch64
 
           - os: darwin
-            arch: x86_64
-            runner: macos-12
-            cc: cc
-            artifact: websockify-darwin-x86_64
-
-          - os: darwin
             arch: arm64
             runner: macos-latest
             cc: cc
