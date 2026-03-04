@@ -63,12 +63,10 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: dist/
+          merge-multiple: true
 
-      - name: Flatten artifacts
-        run: |
-          find dist -mindepth 2 -maxdepth 2 -type f -exec mv {} dist/ \;
-          find dist -mindepth 1 -maxdepth 1 -type d -exec rmdir {} \;
-          ls -lh dist/
+      - name: List artifacts
+        run: ls -lh dist/
 
       - name: Create release
         uses: softprops/action-gh-release@v2
