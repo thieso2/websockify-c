@@ -3,10 +3,11 @@
 #include "util.h"
 
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
-#include <ctype.h>
 #include <limits.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -14,17 +15,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <strings.h>
+#include <time.h>
 #include <unistd.h>
 
 #define HANDSHAKE_MAX 65536
 #define IO_BUF_SIZE 8192
-
-static volatile sig_atomic_t g_stop = 0;
+#define MAX_CONNS 1024
 
 typedef struct {
     int verbose;
@@ -81,10 +82,6 @@ typedef struct {
 } ws_options_t;
 
 typedef struct {
-    int fd;
-} ws_fd_ctx_t;
-
-typedef struct {
     ws_buf_t raw;
     int consumed;
     char *method;
@@ -92,6 +89,42 @@ typedef struct {
     char *version;
     ws_headers_t headers;
 } http_request_t;
+
+typedef enum {
+    CONN_HTTP_RECV = 0,
+    CONN_HTTP_SEND,
+    CONN_WS,
+    CONN_DEAD
+} conn_state_t;
+
+typedef struct {
+    int used;
+    conn_state_t state;
+    int client_fd;
+    int target_fd;
+    int target_connecting;
+    int target_open;
+    int close_after_send;
+    http_request_t req;
+    int req_active;
+    ws_conn_t ws;
+    int ws_active;
+    ws_buf_t out_http;
+    ws_buf_t out_target;
+} conn_t;
+
+static volatile sig_atomic_t g_stop = 0;
+
+typedef struct {
+    unsigned long accepted;
+    unsigned long closed;
+    unsigned long http_requests;
+    unsigned long ws_upgrades;
+    unsigned long long client_in_bytes;
+    unsigned long long client_out_bytes;
+    unsigned long long target_in_bytes;
+    unsigned long long target_out_bytes;
+} stats_t;
 
 static void on_signal(int sig)
 {
@@ -119,12 +152,9 @@ static void parser_error(const char *prog, const char *msg)
 static void init_options(ws_options_t *o)
 {
     memset(o, 0, sizeof(*o));
-    o->timeout = 0;
-    o->idle_timeout = 0;
     o->cert = "self.pem";
     o->ssl_version = "default";
     o->wrap_mode = "exit";
-    o->heartbeat = 0;
     o->listen_fd = -1;
 }
 
@@ -138,9 +168,7 @@ static int parse_host_port(const char *arg, char **host_out, int *port_out)
     if (colon) {
         size_t hlen = (size_t)(colon - arg);
         host = (char *)malloc(hlen + 1);
-        if (!host) {
-            return -1;
-        }
+        if (!host) return -1;
         memcpy(host, arg, hlen);
         host[hlen] = '\0';
         if (hlen >= 2 && host[0] == '[' && host[hlen - 1] == ']') {
@@ -150,9 +178,7 @@ static int parse_host_port(const char *arg, char **host_out, int *port_out)
         p = strtol(colon + 1, &endp, 10);
     } else {
         host = strdup("");
-        if (!host) {
-            return -1;
-        }
+        if (!host) return -1;
         p = strtol(arg, &endp, 10);
     }
 
@@ -174,15 +200,11 @@ static int parse_target(const char *arg, char **host_out, int *port_out)
     long p;
     size_t hlen;
 
-    if (!colon || colon == arg || *(colon + 1) == '\0') {
-        return -1;
-    }
+    if (!colon || colon == arg || *(colon + 1) == '\0') return -1;
 
     hlen = (size_t)(colon - arg);
     host = (char *)malloc(hlen + 1);
-    if (!host) {
-        return -1;
-    }
+    if (!host) return -1;
     memcpy(host, arg, hlen);
     host[hlen] = '\0';
     if (hlen >= 2 && host[0] == '[' && host[hlen - 1] == ']') {
@@ -271,132 +293,53 @@ static int parse_options(int argc, char **argv, ws_options_t *o)
         o->wrap_argv = &argv[dd + 1];
         cargc = dd;
     } else {
-        o->has_wrap_cmd = 0;
-        o->wrap_argc = 0;
-        o->wrap_argv = NULL;
         cargc = argc;
     }
 
     cargv = argv;
-
     opterr = 0;
     optind = 1;
+
     while ((opt = getopt_long(cargc, cargv, "hvD6", long_opts, &idx)) != -1) {
         switch (opt) {
-        case 'h':
-            usage(argv[0]);
-            exit(0);
-        case 'v':
-            o->verbose = 1;
-            break;
-        case 'D':
-            o->daemon = 1;
-            break;
-        case '6':
-            o->source_is_ipv6 = 1;
-            break;
-        case 1001:
-            o->traffic = 1;
-            break;
-        case 1002:
-            o->record = optarg;
-            break;
-        case 1003:
-            o->run_once = 1;
-            break;
-        case 1004:
-            o->timeout = atoi(optarg);
-            break;
-        case 1005:
-            o->idle_timeout = atoi(optarg);
-            break;
-        case 1006:
-            o->cert = optarg;
-            break;
-        case 1007:
-            o->key = optarg;
-            break;
-        case 1008:
-            o->key_password = optarg;
-            break;
-        case 1009:
-            o->ssl_only = 1;
-            break;
-        case 1010:
-            o->ssl_target = 1;
-            break;
-        case 1011:
-            o->verify_client = 1;
-            break;
-        case 1012:
-            o->cafile = optarg;
-            break;
-        case 1013:
-            o->ssl_version = optarg;
-            break;
-        case 1014:
-            o->ssl_ciphers = optarg;
-            break;
-        case 1015:
-            o->unix_listen = optarg;
-            break;
-        case 1016:
-            o->unix_listen_mode = optarg;
-            break;
-        case 1017:
-            o->unix_target = optarg;
-            break;
-        case 1018:
-            o->inetd = 1;
-            break;
-        case 1019:
-            o->web = optarg;
-            break;
-        case 1020:
-            o->web_auth = 1;
-            break;
-        case 1021:
-            o->wrap_mode = optarg;
-            break;
-        case 1022:
-            o->libserver = 1;
-            break;
-        case 1023:
-            o->target_cfg = optarg;
-            break;
-        case 1024:
-            o->token_plugin = optarg;
-            break;
-        case 1025:
-            o->token_source = optarg;
-            break;
-        case 1026:
-            o->host_token = 1;
-            break;
-        case 1027:
-            o->auth_plugin = optarg;
-            break;
-        case 1028:
-            o->auth_source = optarg;
-            break;
-        case 1029:
-            o->heartbeat = atoi(optarg);
-            break;
-        case 1030:
-            o->log_file = optarg;
-            break;
-        case 1031:
-            o->syslog = optarg;
-            break;
-        case 1032:
-            o->legacy_syslog = 1;
-            break;
-        case 1033:
-            o->file_only = 1;
-            break;
-        default:
-            parser_error(argv[0], "error: invalid option");
-            return -1;
+        case 'h': usage(argv[0]); exit(0);
+        case 'v': o->verbose = 1; break;
+        case 'D': o->daemon = 1; break;
+        case '6': o->source_is_ipv6 = 1; break;
+        case 1001: o->traffic = 1; break;
+        case 1002: o->record = optarg; break;
+        case 1003: o->run_once = 1; break;
+        case 1004: o->timeout = atoi(optarg); break;
+        case 1005: o->idle_timeout = atoi(optarg); break;
+        case 1006: o->cert = optarg; break;
+        case 1007: o->key = optarg; break;
+        case 1008: o->key_password = optarg; break;
+        case 1009: o->ssl_only = 1; break;
+        case 1010: o->ssl_target = 1; break;
+        case 1011: o->verify_client = 1; break;
+        case 1012: o->cafile = optarg; break;
+        case 1013: o->ssl_version = optarg; break;
+        case 1014: o->ssl_ciphers = optarg; break;
+        case 1015: o->unix_listen = optarg; break;
+        case 1016: o->unix_listen_mode = optarg; break;
+        case 1017: o->unix_target = optarg; break;
+        case 1018: o->inetd = 1; break;
+        case 1019: o->web = optarg; break;
+        case 1020: o->web_auth = 1; break;
+        case 1021: o->wrap_mode = optarg; break;
+        case 1022: o->libserver = 1; break;
+        case 1023: o->target_cfg = optarg; break;
+        case 1024: o->token_plugin = optarg; break;
+        case 1025: o->token_source = optarg; break;
+        case 1026: o->host_token = 1; break;
+        case 1027: o->auth_plugin = optarg; break;
+        case 1028: o->auth_source = optarg; break;
+        case 1029: o->heartbeat = atoi(optarg); break;
+        case 1030: o->log_file = optarg; break;
+        case 1031: o->syslog = optarg; break;
+        case 1032: o->legacy_syslog = 1; break;
+        case 1033: o->file_only = 1; break;
+        default: parser_error(argv[0], "error: invalid option"); return -1;
         }
     }
 
@@ -404,7 +347,6 @@ static int parse_options(int argc, char **argv, ws_options_t *o)
         parser_error(argv[0], "error: invalid --ssl-version value");
         return -1;
     }
-
     if (!(strcmp(o->wrap_mode, "exit") == 0 || strcmp(o->wrap_mode, "ignore") == 0 || strcmp(o->wrap_mode, "respawn") == 0)) {
         parser_error(argv[0], "error: invalid --wrap-mode value");
         return -1;
@@ -494,24 +436,28 @@ static int parse_options(int argc, char **argv, ws_options_t *o)
     return 0;
 }
 
-static ssize_t ws_fd_send(ws_ctx_t *ctx, const uint8_t *data, size_t len)
+static int set_nonblocking(int fd)
 {
-    ws_fd_ctx_t *fd_ctx = (ws_fd_ctx_t *)ctx->user_data;
-    size_t off = 0;
-    while (off < len) {
-        ssize_t n = send(fd_ctx->fd, data + off, len - off, 0);
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return -1;
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) return -1;
+    return 0;
+}
+
+static int send_buffer_nb_counted(int fd, ws_buf_t *buf, unsigned long long *counter)
+{
+    while (buf->len > 0) {
+        ssize_t n = send(fd, buf->data, buf->len, 0);
         if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
             return -1;
         }
-        if (n == 0) {
-            break;
-        }
-        off += (size_t)n;
+        if (n == 0) return -1;
+        ws_buf_consume(buf, (size_t)n);
+        *counter += (unsigned long long)n;
     }
-    return (ssize_t)off;
+    return 0;
 }
 
 static int create_listener(const char *host, int port, int prefer_ipv6)
@@ -529,29 +475,26 @@ static int create_listener(const char *host, int port, int prefer_ipv6)
     hints.ai_flags = AI_PASSIVE;
 
     snprintf(port_s, sizeof(port_s), "%d", port);
+    if (getaddrinfo((host && host[0]) ? host : NULL, port_s, &hints, &res) != 0) return -1;
 
-    if (getaddrinfo((host && host[0]) ? host : NULL, port_s, &hints, &res) != 0) {
-        return -1;
-    }
-
-    for (it = res; it != NULL; it = it->ai_next) {
+    for (it = res; it; it = it->ai_next) {
         fd = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
-        if (fd < 0) {
-            continue;
-        }
+        if (fd < 0) continue;
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-        if (bind(fd, it->ai_addr, it->ai_addrlen) == 0 && listen(fd, 64) == 0) {
-            break;
-        }
+        if (bind(fd, it->ai_addr, it->ai_addrlen) == 0 && listen(fd, 128) == 0) break;
         close(fd);
         fd = -1;
     }
 
     freeaddrinfo(res);
+    if (fd >= 0 && set_nonblocking(fd) < 0) {
+        close(fd);
+        return -1;
+    }
     return fd;
 }
 
-static int connect_target(const char *host, int port)
+static int connect_target_nb(const char *host, int port, int *connecting)
 {
     struct addrinfo hints;
     struct addrinfo *res = NULL;
@@ -559,22 +502,29 @@ static int connect_target(const char *host, int port)
     char port_s[16];
     int fd = -1;
 
+    *connecting = 0;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
-
     snprintf(port_s, sizeof(port_s), "%d", port);
 
-    if (getaddrinfo(host, port_s, &hints, &res) != 0) {
-        return -1;
-    }
+    if (getaddrinfo(host, port_s, &hints, &res) != 0) return -1;
 
-    for (it = res; it != NULL; it = it->ai_next) {
+    for (it = res; it; it = it->ai_next) {
         fd = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
-        if (fd < 0) {
+        if (fd < 0) continue;
+        if (set_nonblocking(fd) < 0) {
+            close(fd);
+            fd = -1;
             continue;
         }
+
         if (connect(fd, it->ai_addr, it->ai_addrlen) == 0) {
+            *connecting = 0;
+            break;
+        }
+        if (errno == EINPROGRESS) {
+            *connecting = 1;
             break;
         }
         close(fd);
@@ -601,97 +551,11 @@ static void http_request_free(http_request_t *r)
     free(r->version);
 }
 
-static int read_http_request(int client_fd, http_request_t *req)
-{
-    uint8_t tmp[IO_BUF_SIZE];
-    int consumed;
-
-    while (req->raw.len < HANDSHAKE_MAX) {
-        ssize_t n = recv(client_fd, tmp, sizeof(tmp), 0);
-        if (n <= 0) {
-            return -1;
-        }
-        if (ws_buf_append(&req->raw, tmp, (size_t)n) < 0) {
-            return -1;
-        }
-
-        consumed = ws_http_parse_request(req->raw.data, req->raw.len, &req->method, &req->path, &req->version, &req->headers);
-        if (consumed < 0) {
-            return -1;
-        }
-        if (consumed > 0) {
-            req->consumed = consumed;
-            return 0;
-        }
-    }
-    return -1;
-}
-
-static int send_http_response(int fd, int code, const char *reason, const char *ctype, const uint8_t *body, size_t body_len, int head_only)
-{
-    char hdr[1024];
-    int n = snprintf(hdr, sizeof(hdr),
-                     "HTTP/1.1 %d %s\r\n"
-                     "Connection: close\r\n"
-                     "Content-Type: %s\r\n"
-                     "Content-Length: %zu\r\n"
-                     "\r\n",
-                     code, reason, ctype ? ctype : "text/plain", body_len);
-    if (n <= 0 || (size_t)n >= sizeof(hdr)) {
-        return -1;
-    }
-    {
-        size_t off = 0;
-        while (off < (size_t)n) {
-            ssize_t wn = send(fd, hdr + off, (size_t)n - off, 0);
-            if (wn < 0) {
-                if (errno == EINTR) {
-                    continue;
-                }
-                return -1;
-            }
-            off += (size_t)wn;
-        }
-    }
-    if (!head_only && body_len > 0) {
-        size_t off = 0;
-        while (off < body_len) {
-            ssize_t wn = send(fd, body + off, body_len - off, 0);
-            if (wn < 0) {
-                if (errno == EINTR) {
-                    continue;
-                }
-                return -1;
-            }
-            off += (size_t)wn;
-        }
-    }
-    return 0;
-}
-
-static const char *guess_content_type(const char *path)
-{
-    const char *dot = strrchr(path, '.');
-    if (!dot) return "application/octet-stream";
-    if (strcmp(dot, ".html") == 0 || strcmp(dot, ".htm") == 0) return "text/html";
-    if (strcmp(dot, ".css") == 0) return "text/css";
-    if (strcmp(dot, ".js") == 0) return "application/javascript";
-    if (strcmp(dot, ".txt") == 0) return "text/plain";
-    if (strcmp(dot, ".json") == 0) return "application/json";
-    if (strcmp(dot, ".png") == 0) return "image/png";
-    if (strcmp(dot, ".jpg") == 0 || strcmp(dot, ".jpeg") == 0) return "image/jpeg";
-    if (strcmp(dot, ".gif") == 0) return "image/gif";
-    if (strcmp(dot, ".svg") == 0) return "image/svg+xml";
-    return "application/octet-stream";
-}
-
 static int path_has_parent_ref(const char *p)
 {
     const char *s = p;
     while ((s = strstr(s, "..")) != NULL) {
-        if ((s == p || s[-1] == '/') && (s[2] == '/' || s[2] == '\0')) {
-            return 1;
-        }
+        if ((s == p || s[-1] == '/') && (s[2] == '/' || s[2] == '\0')) return 1;
         s += 2;
     }
     return 0;
@@ -700,13 +564,8 @@ static int path_has_parent_ref(const char *p)
 static int path_under_root(const char *root_real, const char *resolved)
 {
     size_t root_len = strlen(root_real);
-    if (strncmp(resolved, root_real, root_len) != 0) {
-        return 0;
-    }
-    if (resolved[root_len] == '\0' || resolved[root_len] == '/') {
-        return 1;
-    }
-    return 0;
+    if (strncmp(resolved, root_real, root_len) != 0) return 0;
+    return resolved[root_len] == '\0' || resolved[root_len] == '/';
 }
 
 static void html_escape_append(ws_buf_t *out, const char *s)
@@ -721,11 +580,8 @@ static void html_escape_append(ws_buf_t *out, const char *s)
         case '\'': rep = "&#39;"; break;
         default: break;
         }
-        if (rep) {
-            ws_buf_append(out, (const uint8_t *)rep, strlen(rep));
-        } else {
-            ws_buf_append(out, (const uint8_t *)s, 1);
-        }
+        if (rep) ws_buf_append(out, (const uint8_t *)rep, strlen(rep));
+        else ws_buf_append(out, (const uint8_t *)s, 1);
         s++;
     }
 }
@@ -745,89 +601,80 @@ static void url_escape_append(ws_buf_t *out, const char *s)
     }
 }
 
-static int send_file_response(int fd, const char *path, const char *ctype, int head_only, off_t size)
+static const char *guess_content_type(const char *path)
 {
-    FILE *f;
-    uint8_t tmp[IO_BUF_SIZE];
-    size_t rn;
+    const char *dot = strrchr(path, '.');
+    if (!dot) return "application/octet-stream";
+    if (strcmp(dot, ".html") == 0 || strcmp(dot, ".htm") == 0) return "text/html";
+    if (strcmp(dot, ".css") == 0) return "text/css";
+    if (strcmp(dot, ".js") == 0) return "application/javascript";
+    if (strcmp(dot, ".txt") == 0) return "text/plain";
+    if (strcmp(dot, ".json") == 0) return "application/json";
+    if (strcmp(dot, ".png") == 0) return "image/png";
+    if (strcmp(dot, ".jpg") == 0 || strcmp(dot, ".jpeg") == 0) return "image/jpeg";
+    if (strcmp(dot, ".gif") == 0) return "image/gif";
+    if (strcmp(dot, ".svg") == 0) return "image/svg+xml";
+    return "application/octet-stream";
+}
 
-    if (send_http_response(fd, 200, "OK", ctype, NULL, (size_t)size, 1) < 0) {
-        return -1;
+static int append_http_response(ws_buf_t *out, int code, const char *reason, const char *ctype, const uint8_t *body, size_t body_len, int head_only)
+{
+    char hdr[1024];
+    int n = snprintf(hdr, sizeof(hdr),
+                     "HTTP/1.1 %d %s\r\n"
+                     "Connection: close\r\n"
+                     "Content-Type: %s\r\n"
+                     "Content-Length: %zu\r\n"
+                     "\r\n",
+                     code, reason, ctype ? ctype : "text/plain", body_len);
+    if (n <= 0 || (size_t)n >= sizeof(hdr)) return -1;
+    if (ws_buf_append(out, (const uint8_t *)hdr, (size_t)n) < 0) return -1;
+    if (!head_only && body && body_len > 0) {
+        if (ws_buf_append(out, body, body_len) < 0) return -1;
     }
-    if (head_only) {
-        return 0;
-    }
-
-    f = fopen(path, "rb");
-    if (!f) {
-        return -1;
-    }
-    while ((rn = fread(tmp, 1, sizeof(tmp), f)) > 0) {
-        size_t off = 0;
-        while (off < rn) {
-            ssize_t wn = send(fd, tmp + off, rn - off, 0);
-            if (wn < 0) {
-                if (errno == EINTR) {
-                    continue;
-                }
-                fclose(f);
-                return -1;
-            }
-            off += (size_t)wn;
-        }
-    }
-    fclose(f);
     return 0;
 }
 
-static int serve_web_request(int client_fd, const ws_options_t *opt, const http_request_t *req)
+static int build_web_response(const ws_options_t *opt, const http_request_t *req, ws_buf_t *out)
 {
     int head_only;
     char root_real[PATH_MAX];
     char rel[PATH_MAX];
     char candidate[PATH_MAX];
     char resolved[PATH_MAX];
-    struct stat st;
     char *qmark;
+    struct stat st;
 
     if (!opt->web) {
         const char *msg = "Method Not Allowed\n";
-        return send_http_response(client_fd, 405, "Method Not Allowed", "text/plain", (const uint8_t *)msg, strlen(msg), 0);
+        return append_http_response(out, 405, "Method Not Allowed", "text/plain", (const uint8_t *)msg, strlen(msg), 0);
     }
 
     if (strcmp(req->method, "GET") != 0 && strcmp(req->method, "HEAD") != 0) {
         const char *msg = "Method Not Allowed\n";
-        return send_http_response(client_fd, 405, "Method Not Allowed", "text/plain", (const uint8_t *)msg, strlen(msg), 0);
+        return append_http_response(out, 405, "Method Not Allowed", "text/plain", (const uint8_t *)msg, strlen(msg), 0);
     }
     head_only = (strcmp(req->method, "HEAD") == 0);
 
     if (!realpath(opt->web, root_real)) {
         const char *msg = "Web root not found\n";
-        return send_http_response(client_fd, 500, "Internal Server Error", "text/plain", (const uint8_t *)msg, strlen(msg), head_only);
+        return append_http_response(out, 500, "Internal Server Error", "text/plain", (const uint8_t *)msg, strlen(msg), head_only);
     }
 
     snprintf(rel, sizeof(rel), "%s", req->path ? req->path : "/");
     qmark = strchr(rel, '?');
-    if (qmark) {
-        *qmark = '\0';
-    }
-    if (rel[0] == '\0') {
-        snprintf(rel, sizeof(rel), "/");
-    }
-    if (rel[0] == '/') {
-        memmove(rel, rel + 1, strlen(rel));
-    }
-    if (rel[0] == '\0') {
-        snprintf(rel, sizeof(rel), ".");
-    }
+    if (qmark) *qmark = '\0';
+    if (rel[0] == '\0') snprintf(rel, sizeof(rel), "/");
+    if (rel[0] == '/') memmove(rel, rel + 1, strlen(rel));
+    if (rel[0] == '\0') snprintf(rel, sizeof(rel), ".");
     if (path_has_parent_ref(rel)) {
         const char *msg = "Forbidden\n";
-        return send_http_response(client_fd, 403, "Forbidden", "text/plain", (const uint8_t *)msg, strlen(msg), head_only);
+        return append_http_response(out, 403, "Forbidden", "text/plain", (const uint8_t *)msg, strlen(msg), head_only);
     }
 
     if (strlen(root_real) + 1 + strlen(rel) + 1 > sizeof(candidate)) {
         const char *msg = "Request URI Too Long\n";
-        return send_http_response(client_fd, 414, "Request-URI Too Long", "text/plain", (const uint8_t *)msg, strlen(msg), head_only);
+        return append_http_response(out, 414, "Request-URI Too Long", "text/plain", (const uint8_t *)msg, strlen(msg), head_only);
     }
     {
         size_t root_len = strlen(root_real);
@@ -837,37 +684,37 @@ static int serve_web_request(int client_fd, const ws_options_t *opt, const http_
         memcpy(candidate + root_len + 1, rel, rel_len);
         candidate[root_len + 1 + rel_len] = '\0';
     }
+
     if (!realpath(candidate, resolved)) {
         const char *msg = "Not Found\n";
-        return send_http_response(client_fd, 404, "Not Found", "text/plain", (const uint8_t *)msg, strlen(msg), head_only);
+        return append_http_response(out, 404, "Not Found", "text/plain", (const uint8_t *)msg, strlen(msg), head_only);
     }
     if (!path_under_root(root_real, resolved)) {
         const char *msg = "Forbidden\n";
-        return send_http_response(client_fd, 403, "Forbidden", "text/plain", (const uint8_t *)msg, strlen(msg), head_only);
+        return append_http_response(out, 403, "Forbidden", "text/plain", (const uint8_t *)msg, strlen(msg), head_only);
     }
     if (stat(resolved, &st) < 0) {
         const char *msg = "Not Found\n";
-        return send_http_response(client_fd, 404, "Not Found", "text/plain", (const uint8_t *)msg, strlen(msg), head_only);
+        return append_http_response(out, 404, "Not Found", "text/plain", (const uint8_t *)msg, strlen(msg), head_only);
     }
 
     if (S_ISDIR(st.st_mode)) {
         if (opt->file_only) {
             const char *msg = "Not Found\n";
-            return send_http_response(client_fd, 404, "Not Found", "text/plain", (const uint8_t *)msg, strlen(msg), head_only);
-        } else {
+            return append_http_response(out, 404, "Not Found", "text/plain", (const uint8_t *)msg, strlen(msg), head_only);
+        }
+        {
             DIR *d = opendir(resolved);
-            ws_buf_t body;
             struct dirent *ent;
+            ws_buf_t body;
             if (!d) {
                 const char *msg = "Forbidden\n";
-                return send_http_response(client_fd, 403, "Forbidden", "text/plain", (const uint8_t *)msg, strlen(msg), head_only);
+                return append_http_response(out, 403, "Forbidden", "text/plain", (const uint8_t *)msg, strlen(msg), head_only);
             }
             ws_buf_init(&body);
             ws_buf_append(&body, (const uint8_t *)"<html><body><ul>\n", 17);
             while ((ent = readdir(d)) != NULL) {
-                if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
-                    continue;
-                }
+                if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
                 ws_buf_append(&body, (const uint8_t *)"<li><a href=\"", 13);
                 url_escape_append(&body, ent->d_name);
                 ws_buf_append(&body, (const uint8_t *)"\">", 2);
@@ -876,103 +723,45 @@ static int serve_web_request(int client_fd, const ws_options_t *opt, const http_
             }
             ws_buf_append(&body, (const uint8_t *)"</ul></body></html>\n", 19);
             closedir(d);
-            send_http_response(client_fd, 200, "OK", "text/html", body.data, body.len, head_only);
+            if (append_http_response(out, 200, "OK", "text/html", body.data, body.len, head_only) < 0) {
+                ws_buf_free(&body);
+                return -1;
+            }
             ws_buf_free(&body);
             return 0;
         }
     }
 
     if (S_ISREG(st.st_mode)) {
-        return send_file_response(client_fd, resolved, guess_content_type(resolved), head_only, st.st_size);
+        FILE *f = fopen(resolved, "rb");
+        ws_buf_t body;
+        uint8_t tmp[IO_BUF_SIZE];
+        size_t rn;
+        if (!f) {
+            const char *msg = "Not Found\n";
+            return append_http_response(out, 404, "Not Found", "text/plain", (const uint8_t *)msg, strlen(msg), head_only);
+        }
+        ws_buf_init(&body);
+        while ((rn = fread(tmp, 1, sizeof(tmp), f)) > 0) {
+            if (ws_buf_append(&body, tmp, rn) < 0) {
+                fclose(f);
+                ws_buf_free(&body);
+                return -1;
+            }
+        }
+        fclose(f);
+        if (append_http_response(out, 200, "OK", guess_content_type(resolved), body.data, body.len, head_only) < 0) {
+            ws_buf_free(&body);
+            return -1;
+        }
+        ws_buf_free(&body);
+        return 0;
     }
 
     {
         const char *msg = "Not Found\n";
-        return send_http_response(client_fd, 404, "Not Found", "text/plain", (const uint8_t *)msg, strlen(msg), head_only);
+        return append_http_response(out, 404, "Not Found", "text/plain", (const uint8_t *)msg, strlen(msg), head_only);
     }
-}
-
-static int proxy_connection(int client_fd, int target_fd, ws_conn_t *ws, ws_buf_t *prefetched)
-{
-    uint8_t io_buf[IO_BUF_SIZE];
-
-    if (prefetched->len > 0 && ws_buf_append(&ws->recv_buf, prefetched->data, prefetched->len) < 0) {
-        return -1;
-    }
-
-    while (!g_stop) {
-        fd_set rfds;
-        int maxfd;
-        int rc;
-        ws_frame_t frame;
-
-        while (ws_decode_hybi(ws->recv_buf.data, ws->recv_buf.len, &frame) > 0) {
-            int consumed = (int)frame.length;
-            if (frame.opcode == WS_OPCODE_CLOSE) {
-                ws_shutdown(ws, 1000, "");
-                return 0;
-            }
-            if (frame.opcode == WS_OPCODE_PING) {
-                if (ws_pong(ws, frame.payload, frame.payload_len) != WS_OK) {
-                    return -1;
-                }
-            } else if (frame.opcode == WS_OPCODE_TEXT ||
-                       frame.opcode == WS_OPCODE_BINARY ||
-                       frame.opcode == WS_OPCODE_CONTINUATION) {
-                size_t off = 0;
-                while (off < frame.payload_len) {
-                    ssize_t wn = send(target_fd, frame.payload + off, frame.payload_len - off, 0);
-                    if (wn < 0) {
-                        if (errno == EINTR) {
-                            continue;
-                        }
-                        return -1;
-                    }
-                    if (wn == 0) {
-                        return 0;
-                    }
-                    off += (size_t)wn;
-                }
-            }
-
-            ws_buf_consume(&ws->recv_buf, (size_t)consumed);
-        }
-
-        FD_ZERO(&rfds);
-        FD_SET(client_fd, &rfds);
-        FD_SET(target_fd, &rfds);
-        maxfd = client_fd > target_fd ? client_fd : target_fd;
-
-        rc = select(maxfd + 1, &rfds, NULL, NULL, NULL);
-        if (rc < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return -1;
-        }
-
-        if (FD_ISSET(client_fd, &rfds)) {
-            ssize_t n = recv(client_fd, io_buf, sizeof(io_buf), 0);
-            if (n <= 0) {
-                return 0;
-            }
-            if (ws_buf_append(&ws->recv_buf, io_buf, (size_t)n) < 0) {
-                return -1;
-            }
-        }
-
-        if (FD_ISSET(target_fd, &rfds)) {
-            ssize_t n = recv(target_fd, io_buf, sizeof(io_buf), 0);
-            if (n <= 0) {
-                return 0;
-            }
-            if (ws_send(ws, io_buf, (size_t)n) != WS_OK) {
-                return -1;
-            }
-        }
-    }
-
-    return 0;
 }
 
 static int is_websocket_upgrade(const http_request_t *req)
@@ -981,67 +770,191 @@ static int is_websocket_upgrade(const http_request_t *req)
     return (upgrade && strcasecmp(upgrade, "websocket") == 0);
 }
 
-static void handle_client(const ws_options_t *opt, int client_fd)
+static void conn_reset(conn_t *c)
 {
-    http_request_t req;
+    memset(c, 0, sizeof(*c));
+    c->client_fd = -1;
+    c->target_fd = -1;
+}
 
-    http_request_init(&req);
-    if (read_http_request(client_fd, &req) == 0) {
-        if (is_websocket_upgrade(&req)) {
-            int target_fd;
-            ws_conn_t ws;
-            ws_fd_ctx_t fd_ctx;
-            ws_buf_t prefetched;
+static void conn_init(conn_t *c, int client_fd)
+{
+    conn_reset(c);
+    c->used = 1;
+    c->state = CONN_HTTP_RECV;
+    c->client_fd = client_fd;
+    c->target_fd = -1;
+    c->req_active = 1;
+    http_request_init(&c->req);
+    ws_buf_init(&c->out_http);
+    ws_buf_init(&c->out_target);
+}
 
-            if (!req.method || strcmp(req.method, "GET") != 0) {
-                const char *msg = "Method Not Allowed\n";
-                send_http_response(client_fd, 405, "Method Not Allowed", "text/plain", (const uint8_t *)msg, strlen(msg), 0);
-            } else {
-                ws_conn_init(&ws, 0);
-                ws_buf_init(&prefetched);
-                fd_ctx.fd = client_fd;
-                ws.ctx.user_data = &fd_ctx;
-                ws.ctx.io_send = ws_fd_send;
+static void conn_close(conn_t *c)
+{
+    if (c->client_fd >= 0) close(c->client_fd);
+    if (c->target_fd >= 0) close(c->target_fd);
+    if (c->req_active) http_request_free(&c->req);
+    if (c->ws_active) ws_conn_free(&c->ws);
+    ws_buf_free(&c->out_http);
+    ws_buf_free(&c->out_target);
+    conn_reset(c);
+}
 
-                if (ws_accept(&ws, &req.headers) == WS_OK) {
-                    target_fd = connect_target(opt->target_host, opt->target_port);
-                    if (target_fd < 0) {
-                        ws_shutdown(&ws, 1011, "Failed to connect to downstream server");
-                    } else {
-                        if ((size_t)req.consumed < req.raw.len) {
-                            ws_buf_append(&prefetched, req.raw.data + req.consumed, req.raw.len - (size_t)req.consumed);
-                        }
-                        (void)proxy_connection(client_fd, target_fd, &ws, &prefetched);
-                        close(target_fd);
-                    }
-                } else {
-                    const char *msg = "Bad Request\n";
-                    send_http_response(client_fd, 400, "Bad Request", "text/plain", (const uint8_t *)msg, strlen(msg), 0);
-                }
+static int find_free_conn(conn_t *conns)
+{
+    int i;
+    for (i = 0; i < MAX_CONNS; i++) if (!conns[i].used) return i;
+    return -1;
+}
 
-                ws_buf_free(&prefetched);
-                ws_conn_free(&ws);
-            }
-        } else {
-            (void)serve_web_request(client_fd, opt, &req);
-        }
+static void process_http_if_complete(conn_t *c, const ws_options_t *opt)
+{
+    int consumed;
+
+    if (!c->req_active || c->state != CONN_HTTP_RECV) return;
+
+    consumed = ws_http_parse_request(c->req.raw.data, c->req.raw.len,
+                                     &c->req.method, &c->req.path, &c->req.version,
+                                     &c->req.headers);
+    if (consumed < 0) {
+        c->state = CONN_DEAD;
+        return;
     }
-    http_request_free(&req);
+    if (consumed == 0) return;
+
+    c->req.consumed = consumed;
+
+    if (is_websocket_upgrade(&c->req)) {
+        int connecting = 0;
+        if (!c->req.method || strcmp(c->req.method, "GET") != 0) {
+            const char *msg = "Method Not Allowed\n";
+            append_http_response(&c->out_http, 405, "Method Not Allowed", "text/plain", (const uint8_t *)msg, strlen(msg), 0);
+            c->state = CONN_HTTP_SEND;
+            c->close_after_send = 1;
+            return;
+        }
+
+        ws_conn_init(&c->ws, 0);
+        c->ws_active = 1;
+        c->ws.ctx.io_send = NULL;
+        c->ws.ctx.user_data = NULL;
+        if (ws_accept(&c->ws, &c->req.headers) != WS_OK) {
+            const char *msg = "Bad Request\n";
+            append_http_response(&c->out_http, 400, "Bad Request", "text/plain", (const uint8_t *)msg, strlen(msg), 0);
+            c->state = CONN_HTTP_SEND;
+            c->close_after_send = 1;
+            return;
+        }
+
+        if ((size_t)c->req.consumed < c->req.raw.len) {
+            ws_buf_append(&c->ws.recv_buf, c->req.raw.data + c->req.consumed, c->req.raw.len - (size_t)c->req.consumed);
+        }
+
+        http_request_free(&c->req);
+        c->req_active = 0;
+
+        c->target_fd = connect_target_nb(opt->target_host, opt->target_port, &connecting);
+        if (c->target_fd < 0) {
+            ws_shutdown(&c->ws, 1011, "Failed to connect to downstream server");
+            c->close_after_send = 1;
+            c->state = CONN_WS;
+            return;
+        }
+        c->target_connecting = connecting;
+        c->target_open = connecting ? 0 : 1;
+        c->state = CONN_WS;
+        return;
+    }
+
+    if (build_web_response(opt, &c->req, &c->out_http) < 0) {
+        c->state = CONN_DEAD;
+        return;
+    }
+    c->state = CONN_HTTP_SEND;
+    c->close_after_send = 1;
+}
+
+static int count_active_conns(conn_t *conns)
+{
+    int i;
+    int n = 0;
+    for (i = 0; i < MAX_CONNS; i++) if (conns[i].used) n++;
+    return n;
+}
+
+static int count_ws_conns(conn_t *conns)
+{
+    int i;
+    int n = 0;
+    for (i = 0; i < MAX_CONNS; i++) {
+        if (conns[i].used && conns[i].state == CONN_WS) n++;
+    }
+    return n;
+}
+
+static void maybe_log_stats(const ws_options_t *opt, conn_t *conns, stats_t *stats, time_t *last_log)
+{
+    time_t now;
+    if (!opt->verbose) return;
+    now = time(NULL);
+    if (*last_log == 0) {
+        *last_log = now;
+        return;
+    }
+    if (now - *last_log < 5) return;
+    *last_log = now;
+    fprintf(stderr,
+            "[stats] active=%d ws=%d accepted=%lu closed=%lu http=%lu upgrades=%lu "
+            "c_in=%llu c_out=%llu t_in=%llu t_out=%llu\n",
+            count_active_conns(conns),
+            count_ws_conns(conns),
+            stats->accepted,
+            stats->closed,
+            stats->http_requests,
+            stats->ws_upgrades,
+            stats->client_in_bytes,
+            stats->client_out_bytes,
+            stats->target_in_bytes,
+            stats->target_out_bytes);
+}
+
+static void pump_ws_frames(conn_t *c)
+{
+    ws_frame_t frame;
+
+    while (ws_decode_hybi(c->ws.recv_buf.data, c->ws.recv_buf.len, &frame) > 0) {
+        int consumed = (int)frame.length;
+        if (frame.opcode == WS_OPCODE_CLOSE) {
+            ws_shutdown(&c->ws, 1000, "");
+            c->close_after_send = 1;
+            c->target_open = 0;
+            if (c->target_fd >= 0) {
+                close(c->target_fd);
+                c->target_fd = -1;
+            }
+        } else if (frame.opcode == WS_OPCODE_PING) {
+            ws_pong(&c->ws, frame.payload, frame.payload_len);
+        } else if (frame.opcode == WS_OPCODE_TEXT || frame.opcode == WS_OPCODE_BINARY || frame.opcode == WS_OPCODE_CONTINUATION) {
+            ws_buf_append(&c->out_target, frame.payload, frame.payload_len);
+        }
+        ws_buf_consume(&c->ws.recv_buf, (size_t)consumed);
+    }
 }
 
 int main(int argc, char **argv)
 {
     ws_options_t opt;
-    int listen_fd = -1;
+    conn_t conns[MAX_CONNS];
+    stats_t stats;
+    int listen_fd;
+    int i;
     int warned = 0;
+    time_t last_stats_log = 0;
 
     init_options(&opt);
+    if (parse_options(argc, argv, &opt) < 0) return 2;
 
-    if (parse_options(argc, argv, &opt) < 0) {
-        return 2;
-    }
-
-    /* Features not yet implemented in native C runtime */
     if (opt.ssl_only || opt.ssl_target || opt.verify_client || opt.cafile || opt.key || opt.key_password || opt.ssl_ciphers) {
         fprintf(stderr, "error: TLS options are parsed but not implemented in native C runtime yet\n");
         return 2;
@@ -1059,23 +972,9 @@ int main(int argc, char **argv)
         return 2;
     }
     if (opt.libserver || opt.syslog || opt.legacy_syslog || opt.log_file || opt.daemon || opt.record || opt.traffic || opt.timeout || opt.idle_timeout) {
-        fprintf(stderr, "warning: some options are currently ignored in native C runtime:");
-        if (opt.libserver) fprintf(stderr, " --libserver");
-        if (opt.syslog) fprintf(stderr, " --syslog");
-        if (opt.legacy_syslog) fprintf(stderr, " --legacy-syslog");
-        if (opt.log_file) fprintf(stderr, " --log-file");
-        if (opt.daemon) fprintf(stderr, " --daemon");
-        if (opt.record) fprintf(stderr, " --record");
-        if (opt.traffic) fprintf(stderr, " --traffic");
-        if (opt.timeout) fprintf(stderr, " --timeout");
-        if (opt.idle_timeout) fprintf(stderr, " --idle-timeout");
-        fprintf(stderr, "\n");
+        fprintf(stderr, "warning: some options are currently ignored in native C runtime\n");
         warned = 1;
     }
-
-    signal(SIGINT, on_signal);
-    signal(SIGTERM, on_signal);
-    signal(SIGCHLD, SIG_IGN);
 
     listen_fd = create_listener(opt.listen_host, opt.listen_port, opt.source_is_ipv6);
     if (listen_fd < 0) {
@@ -1085,50 +984,203 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
+
+    for (i = 0; i < MAX_CONNS; i++) conn_reset(&conns[i]);
+    memset(&stats, 0, sizeof(stats));
+
     fprintf(stderr, "websockify-codex listening on %s:%d -> %s:%d\n",
             (opt.listen_host && opt.listen_host[0]) ? opt.listen_host : "0.0.0.0",
             opt.listen_port,
             opt.target_host,
             opt.target_port);
-    if (warned) {
-        fprintf(stderr, "warning: runtime behavior differs from Python for ignored options\n");
-    }
+    if (warned) fprintf(stderr, "warning: runtime behavior differs from Python for ignored options\n");
 
     while (!g_stop) {
-        int client_fd;
-        pid_t pid;
+        fd_set rfds, wfds;
+        int maxfd = listen_fd;
+        struct timeval tv;
+        struct timeval *tvp = NULL;
 
-        client_fd = accept(listen_fd, NULL, NULL);
-        if (client_fd < 0) {
-            if (errno == EINTR) {
-                continue;
+        FD_ZERO(&rfds);
+        FD_ZERO(&wfds);
+        FD_SET(listen_fd, &rfds);
+
+        for (i = 0; i < MAX_CONNS; i++) {
+            conn_t *c = &conns[i];
+            if (!c->used) continue;
+
+            if (c->state == CONN_HTTP_RECV) {
+                FD_SET(c->client_fd, &rfds);
+                if (c->client_fd > maxfd) maxfd = c->client_fd;
+            } else if (c->state == CONN_HTTP_SEND) {
+                if (c->out_http.len > 0) {
+                    FD_SET(c->client_fd, &wfds);
+                    if (c->client_fd > maxfd) maxfd = c->client_fd;
+                }
+            } else if (c->state == CONN_WS) {
+                FD_SET(c->client_fd, &rfds);
+                if (c->client_fd > maxfd) maxfd = c->client_fd;
+
+                if (c->ws.send_buf.len > 0) {
+                    FD_SET(c->client_fd, &wfds);
+                    if (c->client_fd > maxfd) maxfd = c->client_fd;
+                }
+
+                if (c->target_fd >= 0) {
+                    if (c->target_connecting || c->out_target.len > 0) {
+                        FD_SET(c->target_fd, &wfds);
+                        if (c->target_fd > maxfd) maxfd = c->target_fd;
+                    }
+                    if (c->target_open) {
+                        FD_SET(c->target_fd, &rfds);
+                        if (c->target_fd > maxfd) maxfd = c->target_fd;
+                    }
+                }
             }
-            perror("accept");
+        }
+
+        if (opt.verbose) {
+            tv.tv_sec = 1;
+            tv.tv_usec = 0;
+            tvp = &tv;
+        }
+
+        if (select(maxfd + 1, &rfds, &wfds, NULL, tvp) < 0) {
+            if (errno == EINTR) continue;
+            perror("select");
             break;
         }
 
-        if (opt.run_once) {
-            handle_client(&opt, client_fd);
-            close(client_fd);
-            break;
+        if (FD_ISSET(listen_fd, &rfds)) {
+            while (1) {
+                int cfd = accept(listen_fd, NULL, NULL);
+                int idx;
+                if (cfd < 0) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) break;
+                    perror("accept");
+                    break;
+                }
+                if (set_nonblocking(cfd) < 0) {
+                    close(cfd);
+                    continue;
+                }
+                idx = find_free_conn(conns);
+                if (idx < 0) {
+                    close(cfd);
+                    continue;
+                }
+                conn_init(&conns[idx], cfd);
+                stats.accepted++;
+            }
         }
 
-        pid = fork();
-        if (pid < 0) {
-            perror("fork");
-            close(client_fd);
-            continue;
-        }
-        if (pid == 0) {
-            close(listen_fd);
-            handle_client(&opt, client_fd);
-            close(client_fd);
-            _exit(0);
-        }
-        close(client_fd);
+        for (i = 0; i < MAX_CONNS; i++) {
+            conn_t *c = &conns[i];
+            if (!c->used) continue;
 
+            if (c->state == CONN_HTTP_RECV && FD_ISSET(c->client_fd, &rfds)) {
+                uint8_t tmp[IO_BUF_SIZE];
+                ssize_t n = recv(c->client_fd, tmp, sizeof(tmp), 0);
+                if (n <= 0) {
+                    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+                    } else {
+                        c->state = CONN_DEAD;
+                    }
+                } else {
+                    stats.client_in_bytes += (unsigned long long)n;
+                    if (ws_buf_append(&c->req.raw, tmp, (size_t)n) < 0) c->state = CONN_DEAD;
+                    else {
+                        int prev_state = c->state;
+                        process_http_if_complete(c, &opt);
+                        if (prev_state == CONN_HTTP_RECV && c->state != CONN_HTTP_RECV) {
+                            stats.http_requests++;
+                            if (c->state == CONN_WS) stats.ws_upgrades++;
+                        }
+                    }
+                }
+            }
+
+            if (c->state == CONN_HTTP_SEND && c->out_http.len > 0 && FD_ISSET(c->client_fd, &wfds)) {
+                if (send_buffer_nb_counted(c->client_fd, &c->out_http, &stats.client_out_bytes) < 0) c->state = CONN_DEAD;
+            }
+            if (c->state == CONN_HTTP_SEND && c->out_http.len == 0 && c->close_after_send) {
+                c->state = CONN_DEAD;
+            }
+
+            if (c->state == CONN_WS) {
+                if (FD_ISSET(c->client_fd, &rfds)) {
+                    uint8_t tmp[IO_BUF_SIZE];
+                    ssize_t n = recv(c->client_fd, tmp, sizeof(tmp), 0);
+                    if (n == 0) {
+                        c->state = CONN_DEAD;
+                    } else if (n < 0) {
+                        if (!(errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) c->state = CONN_DEAD;
+                    } else {
+                        stats.client_in_bytes += (unsigned long long)n;
+                        if (ws_buf_append(&c->ws.recv_buf, tmp, (size_t)n) < 0) c->state = CONN_DEAD;
+                        else pump_ws_frames(c);
+                    }
+                }
+
+                if (c->target_fd >= 0 && c->target_connecting && FD_ISSET(c->target_fd, &wfds)) {
+                    int err = 0;
+                    socklen_t sl = sizeof(err);
+                    if (getsockopt(c->target_fd, SOL_SOCKET, SO_ERROR, &err, &sl) < 0 || err != 0) {
+                        ws_shutdown(&c->ws, 1011, "Failed to connect to downstream server");
+                        close(c->target_fd);
+                        c->target_fd = -1;
+                        c->target_connecting = 0;
+                        c->target_open = 0;
+                        c->close_after_send = 1;
+                    } else {
+                        c->target_connecting = 0;
+                        c->target_open = 1;
+                    }
+                }
+
+                if (c->target_fd >= 0 && c->target_open && FD_ISSET(c->target_fd, &rfds)) {
+                    uint8_t tmp[IO_BUF_SIZE];
+                    ssize_t n = recv(c->target_fd, tmp, sizeof(tmp), 0);
+                    if (n == 0) {
+                        close(c->target_fd);
+                        c->target_fd = -1;
+                        c->target_open = 0;
+                        ws_shutdown(&c->ws, 1000, "Target closed");
+                        c->close_after_send = 1;
+                    } else if (n < 0) {
+                        if (!(errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) c->state = CONN_DEAD;
+                    } else {
+                        stats.target_in_bytes += (unsigned long long)n;
+                        if (ws_send(&c->ws, tmp, (size_t)n) != WS_OK) c->state = CONN_DEAD;
+                    }
+                }
+
+                if (c->target_fd >= 0 && c->out_target.len > 0 && FD_ISSET(c->target_fd, &wfds) && !c->target_connecting) {
+                    if (send_buffer_nb_counted(c->target_fd, &c->out_target, &stats.target_out_bytes) < 0) c->state = CONN_DEAD;
+                }
+
+                if (c->ws.send_buf.len > 0 && FD_ISSET(c->client_fd, &wfds)) {
+                    if (send_buffer_nb_counted(c->client_fd, &c->ws.send_buf, &stats.client_out_bytes) < 0) c->state = CONN_DEAD;
+                }
+
+                if (c->close_after_send && c->ws.send_buf.len == 0 && c->out_target.len == 0) c->state = CONN_DEAD;
+            }
+
+            if (c->state == CONN_DEAD) {
+                conn_close(c);
+                stats.closed++;
+                if (opt.run_once) {
+                    g_stop = 1;
+                }
+            }
+        }
+
+        maybe_log_stats(&opt, conns, &stats, &last_stats_log);
     }
 
+    for (i = 0; i < MAX_CONNS; i++) if (conns[i].used) conn_close(&conns[i]);
     close(listen_fd);
     free(opt.listen_host);
     free(opt.target_host);
