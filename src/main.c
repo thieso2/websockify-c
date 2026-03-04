@@ -6,6 +6,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <getopt.h>
+#include <ctype.h>
 #include <limits.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -639,8 +640,18 @@ static int send_http_response(int fd, int code, const char *reason, const char *
     if (n <= 0 || (size_t)n >= sizeof(hdr)) {
         return -1;
     }
-    if (send(fd, hdr, (size_t)n, 0) < 0) {
-        return -1;
+    {
+        size_t off = 0;
+        while (off < (size_t)n) {
+            ssize_t wn = send(fd, hdr + off, (size_t)n - off, 0);
+            if (wn < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                return -1;
+            }
+            off += (size_t)wn;
+        }
     }
     if (!head_only && body_len > 0) {
         size_t off = 0;
@@ -683,6 +694,89 @@ static int path_has_parent_ref(const char *p)
         }
         s += 2;
     }
+    return 0;
+}
+
+static int path_under_root(const char *root_real, const char *resolved)
+{
+    size_t root_len = strlen(root_real);
+    if (strncmp(resolved, root_real, root_len) != 0) {
+        return 0;
+    }
+    if (resolved[root_len] == '\0' || resolved[root_len] == '/') {
+        return 1;
+    }
+    return 0;
+}
+
+static void html_escape_append(ws_buf_t *out, const char *s)
+{
+    while (*s) {
+        const char *rep = NULL;
+        switch (*s) {
+        case '&': rep = "&amp;"; break;
+        case '<': rep = "&lt;"; break;
+        case '>': rep = "&gt;"; break;
+        case '"': rep = "&quot;"; break;
+        case '\'': rep = "&#39;"; break;
+        default: break;
+        }
+        if (rep) {
+            ws_buf_append(out, (const uint8_t *)rep, strlen(rep));
+        } else {
+            ws_buf_append(out, (const uint8_t *)s, 1);
+        }
+        s++;
+    }
+}
+
+static void url_escape_append(ws_buf_t *out, const char *s)
+{
+    while (*s) {
+        unsigned char c = (unsigned char)*s;
+        if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~' || c == '/') {
+            ws_buf_append(out, (const uint8_t *)&c, 1);
+        } else {
+            char esc[4];
+            snprintf(esc, sizeof(esc), "%%%02X", c);
+            ws_buf_append(out, (const uint8_t *)esc, 3);
+        }
+        s++;
+    }
+}
+
+static int send_file_response(int fd, const char *path, const char *ctype, int head_only, off_t size)
+{
+    FILE *f;
+    uint8_t tmp[IO_BUF_SIZE];
+    size_t rn;
+
+    if (send_http_response(fd, 200, "OK", ctype, NULL, (size_t)size, 1) < 0) {
+        return -1;
+    }
+    if (head_only) {
+        return 0;
+    }
+
+    f = fopen(path, "rb");
+    if (!f) {
+        return -1;
+    }
+    while ((rn = fread(tmp, 1, sizeof(tmp), f)) > 0) {
+        size_t off = 0;
+        while (off < rn) {
+            ssize_t wn = send(fd, tmp + off, rn - off, 0);
+            if (wn < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                fclose(f);
+                return -1;
+            }
+            off += (size_t)wn;
+        }
+    }
+    fclose(f);
     return 0;
 }
 
@@ -731,12 +825,23 @@ static int serve_web_request(int client_fd, const ws_options_t *opt, const http_
         return send_http_response(client_fd, 403, "Forbidden", "text/plain", (const uint8_t *)msg, strlen(msg), head_only);
     }
 
-    snprintf(candidate, sizeof(candidate), "%s/%s", root_real, rel);
+    if (strlen(root_real) + 1 + strlen(rel) + 1 > sizeof(candidate)) {
+        const char *msg = "Request URI Too Long\n";
+        return send_http_response(client_fd, 414, "Request-URI Too Long", "text/plain", (const uint8_t *)msg, strlen(msg), head_only);
+    }
+    {
+        size_t root_len = strlen(root_real);
+        size_t rel_len = strlen(rel);
+        memcpy(candidate, root_real, root_len);
+        candidate[root_len] = '/';
+        memcpy(candidate + root_len + 1, rel, rel_len);
+        candidate[root_len + 1 + rel_len] = '\0';
+    }
     if (!realpath(candidate, resolved)) {
         const char *msg = "Not Found\n";
         return send_http_response(client_fd, 404, "Not Found", "text/plain", (const uint8_t *)msg, strlen(msg), head_only);
     }
-    if (strncmp(resolved, root_real, strlen(root_real)) != 0) {
+    if (!path_under_root(root_real, resolved)) {
         const char *msg = "Forbidden\n";
         return send_http_response(client_fd, 403, "Forbidden", "text/plain", (const uint8_t *)msg, strlen(msg), head_only);
     }
@@ -760,12 +865,14 @@ static int serve_web_request(int client_fd, const ws_options_t *opt, const http_
             ws_buf_init(&body);
             ws_buf_append(&body, (const uint8_t *)"<html><body><ul>\n", 17);
             while ((ent = readdir(d)) != NULL) {
-                char line[512];
                 if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
                     continue;
                 }
-                snprintf(line, sizeof(line), "<li><a href=\"%s\">%s</a></li>\n", ent->d_name, ent->d_name);
-                ws_buf_append(&body, (const uint8_t *)line, strlen(line));
+                ws_buf_append(&body, (const uint8_t *)"<li><a href=\"", 13);
+                url_escape_append(&body, ent->d_name);
+                ws_buf_append(&body, (const uint8_t *)"\">", 2);
+                html_escape_append(&body, ent->d_name);
+                ws_buf_append(&body, (const uint8_t *)"</a></li>\n", 10);
             }
             ws_buf_append(&body, (const uint8_t *)"</ul></body></html>\n", 19);
             closedir(d);
@@ -776,27 +883,7 @@ static int serve_web_request(int client_fd, const ws_options_t *opt, const http_
     }
 
     if (S_ISREG(st.st_mode)) {
-        FILE *f = fopen(resolved, "rb");
-        ws_buf_t body;
-        uint8_t tmp[IO_BUF_SIZE];
-        size_t rn;
-        int rc;
-        if (!f) {
-            const char *msg = "Not Found\n";
-            return send_http_response(client_fd, 404, "Not Found", "text/plain", (const uint8_t *)msg, strlen(msg), head_only);
-        }
-        ws_buf_init(&body);
-        while ((rn = fread(tmp, 1, sizeof(tmp), f)) > 0) {
-            if (ws_buf_append(&body, tmp, rn) < 0) {
-                fclose(f);
-                ws_buf_free(&body);
-                return -1;
-            }
-        }
-        fclose(f);
-        rc = send_http_response(client_fd, 200, "OK", guess_content_type(resolved), body.data, body.len, head_only);
-        ws_buf_free(&body);
-        return rc;
+        return send_file_response(client_fd, resolved, guess_content_type(resolved), head_only, st.st_size);
     }
 
     {
@@ -894,10 +981,59 @@ static int is_websocket_upgrade(const http_request_t *req)
     return (upgrade && strcasecmp(upgrade, "websocket") == 0);
 }
 
+static void handle_client(const ws_options_t *opt, int client_fd)
+{
+    http_request_t req;
+
+    http_request_init(&req);
+    if (read_http_request(client_fd, &req) == 0) {
+        if (is_websocket_upgrade(&req)) {
+            int target_fd;
+            ws_conn_t ws;
+            ws_fd_ctx_t fd_ctx;
+            ws_buf_t prefetched;
+
+            if (!req.method || strcmp(req.method, "GET") != 0) {
+                const char *msg = "Method Not Allowed\n";
+                send_http_response(client_fd, 405, "Method Not Allowed", "text/plain", (const uint8_t *)msg, strlen(msg), 0);
+            } else {
+                ws_conn_init(&ws, 0);
+                ws_buf_init(&prefetched);
+                fd_ctx.fd = client_fd;
+                ws.ctx.user_data = &fd_ctx;
+                ws.ctx.io_send = ws_fd_send;
+
+                if (ws_accept(&ws, &req.headers) == WS_OK) {
+                    target_fd = connect_target(opt->target_host, opt->target_port);
+                    if (target_fd < 0) {
+                        ws_shutdown(&ws, 1011, "Failed to connect to downstream server");
+                    } else {
+                        if ((size_t)req.consumed < req.raw.len) {
+                            ws_buf_append(&prefetched, req.raw.data + req.consumed, req.raw.len - (size_t)req.consumed);
+                        }
+                        (void)proxy_connection(client_fd, target_fd, &ws, &prefetched);
+                        close(target_fd);
+                    }
+                } else {
+                    const char *msg = "Bad Request\n";
+                    send_http_response(client_fd, 400, "Bad Request", "text/plain", (const uint8_t *)msg, strlen(msg), 0);
+                }
+
+                ws_buf_free(&prefetched);
+                ws_conn_free(&ws);
+            }
+        } else {
+            (void)serve_web_request(client_fd, opt, &req);
+        }
+    }
+    http_request_free(&req);
+}
+
 int main(int argc, char **argv)
 {
     ws_options_t opt;
     int listen_fd = -1;
+    int warned = 0;
 
     init_options(&opt);
 
@@ -923,12 +1059,23 @@ int main(int argc, char **argv)
         return 2;
     }
     if (opt.libserver || opt.syslog || opt.legacy_syslog || opt.log_file || opt.daemon || opt.record || opt.traffic || opt.timeout || opt.idle_timeout) {
-        fprintf(stderr, "error: selected compatibility options are parsed but not implemented in native C runtime yet\n");
-        return 2;
+        fprintf(stderr, "warning: some options are currently ignored in native C runtime:");
+        if (opt.libserver) fprintf(stderr, " --libserver");
+        if (opt.syslog) fprintf(stderr, " --syslog");
+        if (opt.legacy_syslog) fprintf(stderr, " --legacy-syslog");
+        if (opt.log_file) fprintf(stderr, " --log-file");
+        if (opt.daemon) fprintf(stderr, " --daemon");
+        if (opt.record) fprintf(stderr, " --record");
+        if (opt.traffic) fprintf(stderr, " --traffic");
+        if (opt.timeout) fprintf(stderr, " --timeout");
+        if (opt.idle_timeout) fprintf(stderr, " --idle-timeout");
+        fprintf(stderr, "\n");
+        warned = 1;
     }
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
+    signal(SIGCHLD, SIG_IGN);
 
     listen_fd = create_listener(opt.listen_host, opt.listen_port, opt.source_is_ipv6);
     if (listen_fd < 0) {
@@ -943,10 +1090,13 @@ int main(int argc, char **argv)
             opt.listen_port,
             opt.target_host,
             opt.target_port);
+    if (warned) {
+        fprintf(stderr, "warning: runtime behavior differs from Python for ignored options\n");
+    }
 
     while (!g_stop) {
         int client_fd;
-        http_request_t req;
+        pid_t pid;
 
         client_fd = accept(listen_fd, NULL, NULL);
         if (client_fd < 0) {
@@ -957,54 +1107,26 @@ int main(int argc, char **argv)
             break;
         }
 
-        http_request_init(&req);
-        if (read_http_request(client_fd, &req) == 0) {
-            if (is_websocket_upgrade(&req)) {
-                int target_fd;
-                ws_conn_t ws;
-                ws_fd_ctx_t fd_ctx;
-                ws_buf_t prefetched;
-
-                if (!req.method || strcmp(req.method, "GET") != 0) {
-                    const char resp[] = "HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n";
-                    send(client_fd, resp, sizeof(resp) - 1, 0);
-                } else {
-                    target_fd = connect_target(opt.target_host, opt.target_port);
-                    if (target_fd < 0) {
-                        perror("connect_target");
-                    } else {
-                        ws_conn_init(&ws, 0);
-                        ws_buf_init(&prefetched);
-                        fd_ctx.fd = client_fd;
-                        ws.ctx.user_data = &fd_ctx;
-                        ws.ctx.io_send = ws_fd_send;
-
-                        if (ws_accept(&ws, &req.headers) == WS_OK) {
-                            if ((size_t)req.consumed < req.raw.len) {
-                                ws_buf_append(&prefetched, req.raw.data + req.consumed, req.raw.len - (size_t)req.consumed);
-                            }
-                            (void)proxy_connection(client_fd, target_fd, &ws, &prefetched);
-                        } else {
-                            const char resp[] = "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n";
-                            send(client_fd, resp, sizeof(resp) - 1, 0);
-                        }
-
-                        ws_buf_free(&prefetched);
-                        ws_conn_free(&ws);
-                        close(target_fd);
-                    }
-                }
-            } else {
-                (void)serve_web_request(client_fd, &opt, &req);
-            }
-        }
-
-        http_request_free(&req);
-        close(client_fd);
-
         if (opt.run_once) {
+            handle_client(&opt, client_fd);
+            close(client_fd);
             break;
         }
+
+        pid = fork();
+        if (pid < 0) {
+            perror("fork");
+            close(client_fd);
+            continue;
+        }
+        if (pid == 0) {
+            close(listen_fd);
+            handle_client(&opt, client_fd);
+            close(client_fd);
+            _exit(0);
+        }
+        close(client_fd);
+
     }
 
     close(listen_fd);
